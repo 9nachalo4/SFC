@@ -12,6 +12,8 @@ import hmac
 import traceback
 import winsound
 import math
+import random
+import csv
 import struct
 import wave
 from tkinter import ttk
@@ -1768,13 +1770,402 @@ class HistoryWindow(tk.Toplevel):
         status = f' · {self.cloud_status}' if self.mode.get() == 'cloud' else ''
         self.result_lbl.configure(text=f'{count} записів / wpisów{status}')
 
+# ---------------- Weight identification prototype ----------------
+WEIGHT_HISTORY_PATH = os.path.join(BASE_DIR, 'weight_history.json')
+
+
+def weight_prefix_match(number, prefix):
+    return (bool(re.fullmatch(prefix.replace('*', r'\d'), number))
+            if '*' in prefix else number.startswith(prefix))
+
+
+def weight_value(value):
+    v = float(str(value).strip().replace(',', '.'))
+    if not math.isfinite(v) or v <= 0:
+        raise ValueError('positive finite value required')
+    return v
+
+
+def weight_count(value):
+    v = str(value).strip()
+    if not v.isdigit() or not 1 <= int(v) <= 100000:
+        raise ValueError('invalid quantity')
+    return int(v)
+
+
+def weight_demo_rows(number):
+    # Deterministic artificial values only; deliberately overlapping weights.
+    h = int(hashlib.sha256(('SFC-WEIGHT-DEMO-v1:' + number).encode()).hexdigest()[:12], 16)
+    center = 80 + (h % 8001) / 100
+    return [{'count':10,'net_g':round((center + offset)*10, 2),
+             'time':'DEMO ' + str(i+1)} for i,offset in enumerate((-0.25, 0.0, 0.25))]
+
+
+def weight_stats(rows):
+    averages = [r['net_g']/r['count'] for r in rows]
+    return sum(r['net_g'] for r in rows)/sum(r['count'] for r in rows), min(averages), max(averages)
+
+
+def weight_candidates(numbers, references, prefix, measured, tolerance):
+    filtered = sorted(n for n in numbers if weight_prefix_match(n, prefix))
+    matches, unknown = [], []
+    for n in filtered:
+        rows = references.get(n, [])
+        if not rows:
+            unknown.append(n)
+            continue
+        center, lower, upper = weight_stats(rows)
+        if measured is None or lower - tolerance - 1e-9 <= measured <= upper + tolerance + 1e-9:
+            matches.append((n, center, None if measured is None else abs(center-measured), lower, upper))
+    matches.sort(key=lambda r: (r[2] if r[2] is not None else 0, r[0]))
+    return filtered, matches, unknown
+
+
+def load_weight_history():
+    if not os.path.exists(WEIGHT_HISTORY_PATH):
+        return {}
+    with open(WEIGHT_HISTORY_PATH, encoding='utf-8') as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict) or raw.get('version') != 1 or not isinstance(raw.get('references'), dict):
+        raise ValueError('Invalid weight history format')
+    out = {}
+    for n, rows in raw['references'].items():
+        if not is_valid_number(n) or not isinstance(rows, list):
+            raise ValueError('Invalid reference number')
+        out[n] = [dict(time=str(r['time']), count=weight_count(r['count']), net_g=weight_value(r['net_g'])) for r in rows]
+    return out
+
+
+def save_weight_history(references):
+    fd, path = tempfile.mkstemp(prefix='weights_', suffix='.tmp', dir=BASE_DIR)
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as f:
+            json.dump({'version':1,'references':references},f,ensure_ascii=False,indent=2)
+        os.replace(path, WEIGHT_HISTORY_PATH)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def weight_batch_test(numbers, references, tolerance, limit=250):
+    """Synthetic held-out groups; targets sampled from the complete photo catalog."""
+    rng = random.Random(250)
+    pool = sorted(n for n in numbers if references.get(n))
+    targets = rng.sample(pool, min(limit, len(pool)))
+    rows = []
+    for n in targets:
+        center, _, _ = weight_stats(references[n])
+        # New independent artificial pieces, rather than reusing reference measurements.
+        measured = sum(center + rng.gauss(0, 0.65) for _ in range(10)) / 10
+        bulk = sum(center + rng.gauss(0, 0.65) for _ in range(250))
+        estimate = math.floor(bulk / measured + 0.5)
+        for k in sorted(set((2, 3, 4, len(n)-1, len(n)))):
+            prefix = n[:k] + '*'*(len(n)-k)
+            _, matches, unknown = weight_candidates(numbers, references, prefix, measured, tolerance)
+            candidates = [r[0] for r in matches] + unknown
+            count = len(candidates)
+            rows.append(dict(number=n, prefix=prefix, digits=k, unit_g=round(measured, 4),
+                             sample_net_g=round(measured*10, 4), bulk_net_g=round(bulk, 4),
+                             estimated_count=estimate, candidates=count, correct=n in candidates,
+                             visible=0<count<=5, unique=count==1 and n in candidates))
+    return rows
+
+
+class WeightPanel:
+    """Demo/manual weight provider; never writes synthetic values to production history."""
+    def __init__(self, workspace, page):
+        self.ws, self.page, self.app = workspace, page, workspace.app
+        self.t = workspace.t
+        self.demo = tk.BooleanVar(value=True)
+        self.prefix = tk.StringVar(value='51***')
+        self.qty = tk.StringVar(value='10')
+        self.net = tk.StringVar()
+        self.tol = tk.StringVar(value='1.0')
+        self.target = tk.StringVar()
+        self.bulk = tk.StringVar()
+        self.chosen = None
+        self.cards_signature = None
+        self.photo_refs = []
+        self.demo_cache_key = None
+        self.demo_refs = {}
+        self.real_error = ''
+        try:
+            self.real_refs = load_weight_history()
+        except Exception as e:
+            self.real_refs = {}
+            self.real_error = str(e)
+        self._build()
+        for var in (self.prefix,self.qty,self.net,self.tol):
+            var.trace_add('write',lambda *_: self.refresh())
+        self.bulk.trace_add('write',lambda *_: self.update_bulk())
+        self.refresh()
+
+    def _build(self):
+        t, p = self.t, self.page
+        head = ttk.Frame(p); head.pack(fill='x')
+        ttk.Label(head,text=t('Ідентифікація за номером і вагою','Identyfikacja po numerze i wadze'),style='Heading.TLabel').pack(side='left')
+        ttk.Button(head,text=t('База ваг / історія','Baza wag / historia'),command=self.history_dialog).pack(side='right')
+        mode = ttk.Frame(p); mode.pack(fill='x',pady=(5,3))
+        ttk.Radiobutton(mode,text=t('ДЕМО · штучні ваги','DEMO · sztuczne wagi'),variable=self.demo,value=True,command=self.switch_mode).pack(side='left')
+        ttk.Radiobutton(mode,text=t('Ручні реальні вимірювання','Ręczne pomiary rzeczywiste'),variable=self.demo,value=False,command=self.switch_mode).pack(side='left',padx=12)
+        self.mode_note = ttk.Label(p,wraplength=850); self.mode_note.pack(anchor='w',pady=(0,5))
+        demo = ttk.Frame(p); demo.pack(fill='x',pady=(0,7))
+        ttk.Label(demo,text=t('Демо: контрольний номер (необов’язково)','Demo: numer kontrolny (opcjonalny)')).pack(side='left')
+        self.demo_entry=ttk.Entry(demo,textvariable=self.target,width=12); self.demo_entry.pack(side='left',padx=6)
+        self.demo_btn=ttk.Button(demo,text=t('Імітувати 10 гум','Symuluj 10 gum'),command=self.simulate); self.demo_btn.pack(side='left')
+        self.test_btn=ttk.Button(demo,text=t('Тест 250 типів','Test 250 typów'),command=self.batch_dialog); self.test_btn.pack(side='left',padx=5)
+        ttk.Button(demo,text='↻',command=lambda:self.refresh(force=True)).pack(side='right')
+        fields = ttk.Frame(p); fields.pack(fill='x',pady=(0,6))
+        for title,var,width in [(t('Префікс номера','Prefiks numeru'),self.prefix,14),(t('Штук у зразку','Szt. w próbce'),self.qty,10),(t('Нетто зразка, г','Netto próbki, g'),self.net,15),(t('Допуск, г/шт.','Tolerancja, g/szt.'),self.tol,11)]:
+            f=ttk.Frame(fields); f.pack(side='left',fill='x',expand=True,padx=(0,8))
+            ttk.Label(f,text=title).pack(anchor='w'); ttk.Entry(f,textvariable=var,width=width).pack(fill='x',pady=(2,0))
+        self.summary = ttk.Label(p,style='Heading.TLabel'); self.summary.pack(anchor='w',pady=(4,3))
+        self.detail=ttk.Label(p,wraplength=850,justify='left'); self.detail.pack(anchor='w',pady=(0,6))
+        self.deck=ttk.Frame(p); self.deck.pack(fill='both',expand=True)
+        bottom=ttk.Frame(p); bottom.pack(fill='x',pady=(6,0))
+        ttk.Label(bottom,text=t('Нетто всієї партії, г:','Netto całej partii, g:')).pack(side='left')
+        ttk.Entry(bottom,textvariable=self.bulk,width=14).pack(side='left',padx=5)
+        self.bulk_demo_btn=ttk.Button(bottom,text=t('DEMO 250 шт.','DEMO 250 szt.'),command=self.simulate_bulk); self.bulk_demo_btn.pack(side='left',padx=4)
+        self.bulk_label=ttk.Label(bottom,wraplength=500); self.bulk_label.pack(side='left',fill='x',expand=True,padx=4)
+        ttk.Label(p,text=t('Вага не підтверджує номер автоматично. Вибір не змінює історію друку.','Waga nie potwierdza numeru automatycznie. Wybór nie zmienia historii wydruków.'),wraplength=850).pack(anchor='w',pady=(3,0))
+
+    def switch_mode(self):
+        self.net.set(''); self.bulk.set(''); self.chosen=None
+        self.refresh(force=True)
+
+    def catalog(self):
+        cat=self.app._image_catalog
+        names={n for n in cat.snapshot_names() if is_valid_number(n)}
+        if self.demo.get():
+            key=(self.app.images_dir,cat.revision)
+            if key != self.demo_cache_key:
+                self.demo_refs={n:weight_demo_rows(n) for n in names}
+                self.demo_cache_key=key
+            return names,self.demo_refs
+        # Include known numbers without photos, not just references with a photo.
+        known=set(names)|set(self.real_refs)|set(self.app.raw_codes)|set(self.app.work_numbers)
+        for row in self.app.history:
+            n=str(row.get('number') or '')
+            if is_valid_number(n): known.add(n)
+        for info in self.app.cfg.get('number_lists',{}).values():
+            known.update(str(n) for n in info.get('numbers',[]) if is_valid_number(n))
+        return {n for n in known if is_valid_number(n)},self.real_refs
+
+    def simulate(self):
+        if not self.demo.get(): return
+        numbers, refs=self.catalog()
+        candidate=self.target.get().strip()
+        if not candidate:
+            options=sorted(n for n in numbers if n.startswith('51')) or sorted(numbers)
+            if not options:
+                messagebox.showinfo(APP_NAME,self.t('Папка фото порожня або індекс ще готується.','Brak zdjęć lub indeks jeszcze się tworzy.'),parent=self.ws); return
+            candidate=options[len(options)//2]
+        if candidate not in refs:
+            messagebox.showwarning(APP_NAME,self.t('Номер не знайдено серед фото.','Nie znaleziono numeru w zdjęciach.'),parent=self.ws); return
+        center,_,_=weight_stats(refs[candidate])
+        self.target.set(candidate); self.qty.set('10')
+        self.prefix.set(candidate[:2]+'*'*(len(candidate)-2))
+        self.net.set(f'{center*10:.2f}')
+        self.refresh(force=True)
+
+    def refresh(self, force=False):
+        t=self.t
+        demo=self.demo.get()
+        self.demo_entry.configure(state='normal' if demo else 'disabled')
+        self.demo_btn.configure(state='normal' if demo else 'disabled')
+        self.test_btn.configure(state='normal' if demo else 'disabled')
+        self.bulk_demo_btn.configure(state='normal' if demo else 'disabled')
+        self.mode_note.configure(text=t('ДЕМО: усі ваги вигадані, фотографії справжні. Не використовувати у виробництві.','DEMO: wagi sztuczne, zdjęcia rzeczywiste. Nie używać w produkcji.') if demo else t('Ручний режим: лише збережені вимірювання. Немає підключення до ваги.','Tryb ręczny: tylko zapisane pomiary. Waga nie jest podłączona.'))
+        prefix=self.prefix.get().strip()
+        ready=self.app._image_catalog._ready.is_set()
+        if not ready:
+            self.summary.configure(text=t('Індекс фото ще не готовий або папка недоступна','Indeks zdjęć niegotowy lub folder niedostępny'))
+            self.detail.configure(text=t('Перевір папку фото або дочекайся індексації.','Sprawdź folder lub poczekaj na indeks.'))
+            self.render_cards([],('notready',),force); return
+        if not demo and self.real_error:
+            self.summary.configure(text=t('Не вдалося прочитати історію ваг','Nie można odczytać historii wag'))
+            self.detail.configure(text=self.real_error); self.render_cards([],('error',),force); return
+        try:
+            if len(prefix)>7 or not re.fullmatch(r'\d*\**',prefix): raise ValueError('prefix')
+            count=weight_count(self.qty.get()); tol=weight_value(self.tol.get())
+            measured=weight_value(self.net.get())/count if self.net.get().strip() else None
+        except ValueError:
+            self.summary.configure(text=t('Перевір префікс, кількість, вагу та допуск','Sprawdź prefiks, ilość, wagę i tolerancję'))
+            self.detail.configure(text=t('Приклад: 51*** або 511; кількість і маса додатні.','Przykład: 51*** lub 511; ilość i masa dodatnie.'))
+            self.render_cards([],('invalid',),force); return
+        numbers,refs=self.catalog()
+        filtered,matches,unknown=weight_candidates(numbers,refs,prefix,measured,tol)
+        total=len(matches)+len(unknown)
+        self.summary.configure(text=t('Каталог','Katalog')+f' {len(numbers)}  →  '+t('Префікс','Prefiks')+f' {len(filtered)}  →  '+t('Можливі','Możliwe')+f' {total}')
+        base=(t('Середня зразка: ','Średnia próbki: ')+f'{measured:.3f} g  ·  ' if measured is not None else '')+t('Збіги за вагою: ','Zgodne wagowo: ')+str(len(matches))+'  ·  '+t('Без еталона: ','Bez wzorca: ')+str(len(unknown))
+        if not filtered: note=t('Немає номерів з таким префіксом.','Brak numerów z tym prefiksem.')
+        elif measured is None: note=t('Введи нетто відомої кількості гум.','Wpisz netto znanej liczby gum.')
+        elif total>5: note=t('Більше 5 можливих: допиши цифру номера. Фото приховані.','Ponad 5 możliwości: dopisz cyfrę numeru. Zdjęcia ukryte.')
+        elif not total: note=t('Немає збігів. Перевір тару, кількість і еталони.','Brak zgodności. Sprawdź tarę, ilość i wzorce.')
+        elif unknown: note=t('Є невиміряні типи; їх не можна виключити.','Są typy bez pomiaru; nie można ich wykluczyć.')
+        elif total==1: note=t('Один кандидат. Потрібне візуальне підтвердження.','Jeden kandydat. Wymagana kontrola wizualna.')
+        else: note=t('Порівняй фотографії та вибери потрібний номер.','Porównaj zdjęcia i wybierz właściwy numer.')
+        self.detail.configure(text=base+'\n'+note)
+        cards=(matches+[(n,None,None,None,None) for n in unknown]) if measured is not None and 0<total<=5 else []
+        self.render_cards(cards,(demo,self.app.images_dir,self.app._image_catalog.revision,tuple(cards),self.app.code_revision),force)
+
+    def render_cards(self, cards, sig, force=False):
+        if sig==self.cards_signature and not force: return
+        self.cards_signature=sig
+        valid={r[0] for r in cards}
+        if self.chosen not in valid: self.chosen=None
+        for w in self.deck.winfo_children(): w.destroy()
+        self.photo_refs=[]
+        self.select_buttons={}
+        if not cards:
+            ttk.Label(self.deck,text=self.t('Пропозиції з’являться тут (максимум 5).','Tutaj pojawią się propozycje (maksymalnie 5).'),anchor='center').pack(expand=True,fill='both')
+        for i,r in enumerate(cards):
+            n,center,diff,lo,hi=r
+            self.deck.columnconfigure(i,weight=1,uniform='weightcards')
+            frame=ttk.LabelFrame(self.deck,text=n,padding=5); frame.grid(row=0,column=i,sticky='nsew',padx=3,pady=3)
+            img=ttk.Label(frame,text=self.t('Без фото','Brak zdjęcia'),anchor='center'); img.pack(fill='both',expand=True,pady=4)
+            fn=self.app.photo_for(n)
+            if fn:
+                try:
+                    with Image.open(os.path.join(self.app.images_dir,fn)) as src:
+                        im=ImageOps.exif_transpose(src).convert('RGB'); im.thumbnail((142,110),Image.Resampling.LANCZOS)
+                    photo=ImageTk.PhotoImage(im,master=self.ws); self.photo_refs.append(photo); img.configure(image=photo,text='')
+                except Exception: pass
+            desc=self.app.classify_number(n)[0] or ''
+            ttk.Label(frame,text=desc,wraplength=135,justify='center').pack()
+            text=(f'{center:.2f} g/шт.\nΔ {diff:.3f} g' if center is not None else self.t('Немає еталона','Brak wzorca'))
+            if self.app.lang=='pl': text=text.replace('шт.','szt.')
+            ttk.Label(frame,text=text,justify='center').pack(pady=4)
+            codes=self.app.codes_for(n)
+            if codes: ttk.Label(frame,text=' / '.join(codes),wraplength=135,justify='center').pack(pady=2)
+            b=ttk.Button(frame,text=self.t('Обрати','Wybierz'),command=lambda n=n:self.choose(n)); b.pack(fill='x',pady=3); self.select_buttons[n]=b
+            ttk.Button(frame,text=self.t('Ваги','Wagi'),command=lambda n=n:self.history_dialog(n)).pack(fill='x')
+        self.deck.rowconfigure(0,weight=1)
+        # Reset weights on unused columns from a previous longer candidate list.
+        for i in range(len(cards),5): self.deck.columnconfigure(i,weight=0,uniform='')
+        self.update_selection()
+
+    def choose(self,n):
+        self.chosen=n; self.update_selection()
+
+    def update_selection(self):
+        for n,b in self.select_buttons.items(): b.configure(text=('✓ '+n) if n==self.chosen else self.t('Обрати','Wybierz'))
+        self.update_bulk()
+
+    def update_bulk(self):
+        if not hasattr(self,'bulk_label'): return
+        if not self.chosen:
+            self.bulk_label.configure(text=self.t('Спочатку обери кандидата.','Najpierw wybierz kandydata.')); return
+        try:
+            unit=weight_value(self.net.get())/weight_count(self.qty.get())
+            bulk=weight_value(self.bulk.get())
+            qty=math.floor(bulk/unit+0.5)
+            self.bulk_label.configure(text=f'{self.chosen}  ·  ≈ {qty} '+self.t('шт. (оцінка за зразком)','szt. (szacunek z próbki)'))
+        except (ValueError,OverflowError): self.bulk_label.configure(text=self.chosen+'  ·  '+self.t('Введи нетто партії для оцінки кількості.','Wpisz netto partii, aby oszacować ilość.'))
+
+    def simulate_bulk(self):
+        if not self.demo.get(): return
+        _, refs = self.catalog()
+        n = self.target.get().strip()
+        if n not in refs:
+            self.simulate(); n = self.target.get().strip()
+        if n not in refs: return
+        center, _, _ = weight_stats(refs[n])
+        rng = random.Random('bulk250:' + n)
+        mass = sum(center + rng.gauss(0, 0.65) for _ in range(250))
+        self.bulk.set(f'{mass:.2f}')
+
+    def batch_dialog(self):
+        if not self.demo.get(): return
+        t = self.t
+        numbers, refs = self.catalog()
+        if not numbers:
+            messagebox.showinfo(APP_NAME,t('Немає фото для тесту.','Brak zdjęć do testu.'),parent=self.ws); return
+        try: tol = weight_value(self.tol.get())
+        except ValueError:
+            messagebox.showwarning(APP_NAME,t('Перевір допуск.','Sprawdź tolerancję.'),parent=self.ws); return
+        rows = weight_batch_test(numbers, refs, tol)
+        total = len({r['number'] for r in rows})
+        win = tk.Toplevel(self.ws); win.transient(self.ws); fit_dialog(win,1060,720,780,520)
+        win.title('SFC Solutions · DEMO 250')
+        ttk.Label(win,text=t('Тест різних типів: ','Test różnych typów: ')+f'{total}/250  ·  '+t('Повний каталог: ','Pełny katalog: ')+str(len(numbers))+f'  ·  ±{tol:g} g',style='Heading.TLabel').pack(anchor='w',padx=12,pady=8)
+        ttk.Label(win,text=t('Штучні ваги: 10 шт. у зразку, 250 шт. у партії. Порівняння з усім каталогом.','Sztuczne wagi: próbka 10 szt., partia 250 szt. Porównanie z całym katalogiem.'),wraplength=950).pack(anchor='w',padx=12)
+        summary = ttk.Frame(win); summary.pack(fill='x',padx=12,pady=6)
+        for k in sorted({r['digits'] for r in rows}):
+            group = [r for r in rows if r['digits']==k]
+            visible = sum(r['visible'] and r['correct'] for r in group)
+            unique = sum(r['unique'] for r in group)
+            missed = sum(not r['correct'] for r in group)
+            ttk.Label(summary,text=f'{k} '+t('цифр','cyfr')+f':  1–5: {visible}/{len(group)}  |  1: {unique}/{len(group)}  |  '+t('Втрачені','Pominięte')+f': {missed}').pack(anchor='w')
+        tree=self.ws.tree(win,('n','prefix','weight','matches','result','qty'),(t('Номер','Numer'),t('Префікс','Prefiks'),'g/szt.',t('Кандидати','Kandydaci'),t('Результат','Wynik'),t('Оцінка шт.','Szacunek szt.')),(100,115,105,100,190,110))
+        def status(r):
+            if not r['correct']: return t('Ціль втрачено','Cel pominięty')
+            if r['unique']: return t('Один кандидат','Jeden kandydat')
+            if r['visible']: return t('Фото доступні','Zdjęcia dostępne')
+            return t('Фото приховані','Zdjęcia ukryte')
+        for r in rows:
+            tree.insert('','end',values=(r['number'],r['prefix'],f"{r['unit_g']:.3f}",r['candidates'],status(r),r['estimated_count']))
+        def export():
+            path=filedialog.asksaveasfilename(parent=win,defaultextension='.csv',initialfile='SFC_DEMO_250.csv',filetypes=[('CSV','*.csv')])
+            if not path:return
+            try:
+                with open(path,'w',encoding='utf-8-sig',newline='') as f:
+                    writer=csv.DictWriter(f,fieldnames=list(rows[0]),delimiter=';');writer.writeheader();writer.writerows(rows)
+            except OSError as e:messagebox.showerror(APP_NAME,str(e),parent=win)
+        ttk.Button(win,text=t('Експорт CSV','Eksport CSV'),command=export).pack(anchor='e',padx=12,pady=8)
+        self.app._apply_dialog_theme(win)
+
+    def history_dialog(self, number=''):
+        t=self.t; demo=self.demo.get(); numbers,refs=self.catalog()
+        win=tk.Toplevel(self.ws); win.transient(self.ws); fit_dialog(win,700,510,530,420)
+        win.title(t('Історія еталонних ваг','Historia wag wzorcowych')+(' · DEMO' if demo else ''))
+        win.grab_set()
+        row=ttk.Frame(win,padding=10); row.pack(fill='x')
+        ttk.Label(row,text=t('Номер гуми','Numer gumy')).pack(side='left')
+        num=tk.StringVar(value=number or self.chosen or self.target.get() if demo else number or self.chosen or '')
+        entry=ttk.Entry(row,textvariable=num,width=14); entry.pack(side='left',padx=8)
+        info=ttk.Label(win,wraplength=650); info.pack(fill='x',padx=12,pady=5)
+        tree=self.ws.tree(win,('time','qty','net','unit'),(t('Час','Czas'),t('Штук','Szt.'),t('Нетто, г','Netto, g'),t('г/шт.','g/szt.')),(180,80,120,120))
+        def redraw(*_):
+            n=num.get().strip(); data=refs.get(n,[])
+            tree.delete(*tree.get_children())
+            if data:
+                mean,lo,hi=weight_stats(data)
+                info.configure(text=f'{n}  ·  '+t('Вимірювань','Pomiary')+f' {len(data)}  ·  '+t('Середня','Średnia')+f' {mean:.3f} g  ·  '+t('Діапазон середніх','Zakres średnich')+f' {lo:.3f}–{hi:.3f} g')
+            else: info.configure(text=t('Немає еталонних вимірювань.','Brak pomiarów wzorcowych.'))
+            for r in reversed(data): tree.insert('','end',values=(r['time'],r['count'],f"{r['net_g']:.3f}",f"{r['net_g']/r['count']:.3f}"))
+        num.trace_add('write',redraw); redraw()
+        if demo:
+            ttk.Label(win,text=t('Штучні значення тільки для демонстрації; не зберігаються.','Sztuczne wartości tylko do demonstracji; bez zapisu.')).pack(pady=10)
+        else:
+            form=ttk.Frame(win,padding=10); form.pack(fill='x')
+            q=tk.StringVar(value='10'); g=tk.StringVar()
+            ttk.Label(form,text=t('Штук','Szt.')).pack(side='left'); ttk.Entry(form,textvariable=q,width=7).pack(side='left',padx=5)
+            ttk.Label(form,text=t('Нетто, г','Netto, g')).pack(side='left'); ttk.Entry(form,textvariable=g,width=12).pack(side='left',padx=5)
+            def save():
+                try:
+                    if self.real_error: raise ValueError(self.real_error)
+                    n=num.get().strip()
+                    if not is_valid_number(n): raise ValueError(t('Неправильний номер','Nieprawidłowy numer'))
+                    count,net=weight_count(q.get()),weight_value(g.get())
+                    if not messagebox.askyesno(APP_NAME,t('Номер перевірений незалежно, тара обнулена, кількість точна?','Numer zweryfikowany niezależnie, tara wyzerowana, ilość dokładna?'),parent=win): return
+                    new={**self.real_refs,n:list(self.real_refs.get(n,[]))+[{'time':datetime.now().isoformat(timespec='seconds'),'count':count,'net_g':net}]}
+                    save_weight_history(new)
+                    self.real_refs.clear(); self.real_refs.update(new); redraw(); self.refresh(force=True); g.set('')
+                except Exception as exc: messagebox.showerror(APP_NAME,str(exc),parent=win)
+            ttk.Button(form,text=t('Додати еталон','Dodaj wzorzec'),command=save).pack(side='right')
+            ttk.Label(win,text=t('Додавай лише незалежно перевірені номери, не припущення алгоритму.','Dodawaj tylko niezależnie zweryfikowane numery, nie przypuszczenia algorytmu.'),wraplength=650).pack(pady=(0,8))
+        self.app._apply_dialog_theme(win); entry.focus_set()
+
+
+
 class WorkWindow(tk.Toplevel):
     """Separate operational list, missing-photo registry and code conflicts."""
     def __init__(self, app, tab='work'):
         super().__init__(app.root)
         self.app = app
         self.title('SFC Solutions — ' + self.t('Робочі списки', 'Listy robocze'))
-        fit_dialog(self, 900, 590, 680, 480)
+        fit_dialog(self, 1020, 660, 780, 540)
         self.transient(app.root)
         self.protocol('WM_DELETE_WINDOW', self.destroy)
         self._signature = None
@@ -1784,13 +2175,14 @@ class WorkWindow(tk.Toplevel):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
         self.pages = {}
-        for key, title in [('work', self.t('Лист', 'Lista')), ('missing', self.t('Без фото', 'Bez zdjęć')), ('conflicts', self.t('Конфлікти кодів', 'Konflikty kodów'))]:
+        for key, title in [('work', self.t('Лист', 'Lista')), ('missing', self.t('Без фото', 'Bez zdjęć')), ('conflicts', self.t('Конфлікти кодів', 'Konflikty kodów')), ('weight', self.t('Вага · DEMO', 'Waga · DEMO'))]:
             page = ttk.Frame(self.notebook, padding=10)
             self.notebook.add(page, text=title)
             self.pages[key] = page
         self.build_work()
         self.build_missing()
         self.build_conflicts()
+        self.weight_panel = WeightPanel(self, self.pages['weight'])
         self.notebook.bind('<<NotebookTabChanged>>', lambda e: self.refresh(force=True))
         self.select_tab(tab)
         self.refresh(force=True)
@@ -2095,6 +2487,8 @@ class WorkWindow(tk.Toplevel):
                     rows.append((n,(n,app.classify_number(n)[0] or tr(app.lang,'type_none'),self.t('✓ Виконано','✓ Wykonano') if finished else self.t('Очікує','Oczekuje')),'done' if finished else 'pending'))
                 self.fill(self.work_tree,rows)
                 self.preview()
+            elif tab == str(self.pages['weight']):
+                self.weight_panel.refresh()
             elif tab == str(self.pages['missing']):
                 rows = []
                 query = self.missing_search.get().strip().casefold()
@@ -2481,6 +2875,7 @@ class App:
         menu.add_command(label=tr(self.lang, "menu_lists"),
                          command=self.open_lists_editor)
         menu.add_separator()
+        menu.add_command(label="Вага · прототип" if self.lang == "uk" else "Waga · prototyp", command=lambda: self.open_workspace('weight'))
         menu.add_command(label="Лист" if self.lang == "uk" else "Lista robocza", command=lambda: self.open_workspace('work'))
         menu.add_command(label="Історія без фото" if self.lang == "uk" else "Historia bez zdjęć", command=lambda: self.open_workspace('missing'))
         menu.add_command(label="Конфлікти кодів" if self.lang == "uk" else "Konflikty kodów", command=lambda: self.open_workspace('conflicts'))
